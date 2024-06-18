@@ -1,0 +1,685 @@
+<!--!DOCTYPE html>-->
+<html lang="en">
+<!-- 
+This software is provided under the BSD License. Copyright (c) 2024 Xavier de Carné de Carnavalet.
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the original author is acknowledged. See JavaScript source for full license text.
+-->
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chat Application</title>
+    <!-- Bootstrap CSS for styling -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+    <!-- Custom CSS -->
+    <link href="{{ url_for('static', filename='styles.css') }}" rel="stylesheet">
+</head>
+<body onload="initialization()">
+    <div class="container mt-4">
+
+        <h2>Chat Application <small> - (<a href="/logout">Logout</a>)</small></h2>
+        <div class="chat-box">
+            <!-- Chat messages container -->
+            <div id="messages" style="border:1px solid #ccc; height:300px; margin-bottom:20px; overflow-y:scroll; padding:10px;"></div>
+            <!-- User selection dropdown -->
+            <select id="userList" class="form-control mb-2">
+                <option value="-1" disabled selected><i>Choose a contact</i></option>
+                <!-- User options populated here -->
+            </select>
+            <!-- Message input -->
+            <textarea id="messageInput" class="form-control mb-2" placeholder="Type a message..."></textarea>
+            <div class="d-flex justify-content-between">
+                <button onclick="sendMessage()" class="btn btn-primary">Send</button>
+                <div>
+                    <button onclick="refreshKeys()" class="btn btn-secondary btn-sm">Refresh Keys</button>
+                    <button onclick="eraseChat()" class="btn btn-danger btn-sm">Erase Chat</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+<!-- jQuery for simplified JavaScript -->
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"
+        integrity="sha384-1H217gwSVyLSIfaLxHbE7dRb3v4mYCKbpQvzx0cegeju1MVsGrX5xXxAvs/HgeFs"
+        crossorigin="anonymous"></script>
+<script type="text/javascript">
+// Global variables
+let lastMessageId = 0;
+let peer_id = -1;
+const myID = {{ sender_id }}
+let userInfo = {};
+let Salt
+let ivCounter
+
+
+
+async function initialization() {
+    let jwk_PublicKey
+    let jwk_PrivateKey
+    if(localStorage.getItem("publicKey") === null || localStorage.getItem("privateKey") === null){
+        const ecKeys = await crypto.subtle.generateKey({name: "ECDH", namedCurve: "P-384"}, true, ["deriveKey"],);
+        jwk_PublicKey = await crypto.subtle.exportKey("jwk", ecKeys.publicKey);
+        jwk_PrivateKey = await crypto.subtle.exportKey("jwk", ecKeys.privateKey);
+        localStorage.setItem("publicKey", JSON.stringify(jwk_PublicKey));
+        localStorage.setItem("privateKey", JSON.stringify(jwk_PrivateKey));
+
+
+        Salt = 0
+        ivCounter = 0
+    }else{
+        jwk_PublicKey = JSON.parse(localStorage.getItem("publicKey"))
+    }
+
+    const response = await fetch('/push_public_key', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({posterID: myID, publicKey: jwk_PublicKey}),
+    });
+
+    console.log("Public key: ", localStorage.getItem("publicKey"));
+    console.log("Private key: ", localStorage.getItem("privateKey"));
+    const data = await response.json()
+    console.log(data.message)
+
+    if (localStorage.getItem(`ivCounter_${myID}to${peer_id}`) !== null){
+        ivCounter = parseInt(localStorage.getItem(`ivCounter_${myID}to${peer_id}`))
+        console.log("ivCounter updated: ",ivCounter)
+    }
+
+    if (localStorage.getItem(`Salt_${myID}to${peer_id}`) !== null){
+        Salt = parseInt(localStorage.getItem(`Salt_${myID}to${peer_id}`))
+        console.log("Salt updated: ",Salt)
+    }
+}
+
+async function pull_peerPublicKey() {
+    if (peer_id === -1) {
+        console.error("No peer selected to request public key for!");
+        return;
+    }
+    if (localStorage.getItem(`peerPK_${peer_id}`) !== null){
+        console.log(`peer publickey of user ${peer_id} already stored: `,localStorage.getItem(`peerPK_${peer_id}`));
+        return;
+    }
+
+    try{
+        const response = await fetch(`/pull_public_key/${peer_id}`,{
+            method: 'GET',
+            heater:{
+                'Accept':'application/json',
+            }
+        });
+
+        if (!response.ok){
+            const data = await response.json();
+            console.error("Error in HTTP:",data.message)
+            if(data.message === "Public key not found"){
+                alert("It seems that the user haven't logged on yet, please try again later")
+            }
+        }
+
+        const { publicKey } = await response.json();
+        const peerPublicKey = await crypto.subtle.importKey(
+                "jwk",
+                publicKey,
+                {
+                    name: "ECDH",
+                    namedCurve: "P-384"
+                },
+                true,
+                [],
+        );
+        let jwk_peerPublicKey = await crypto.subtle.exportKey("jwk", peerPublicKey);
+        localStorage.setItem(`peerPK_${peer_id}`, JSON.stringify(jwk_peerPublicKey));
+        console.log("Peer publickey obtained successfully: ", localStorage.getItem(`peerPK_${peer_id}`));
+        const AES_MAC = await deriveKeys(peerPublicKey);
+
+        if (AES_MAC){
+            crypto.subtle.exportKey("jwk", AES_MAC.AESKey).then(jwkAES => {
+                localStorage.setItem(`AES${Salt}_USER${myID}to${peer_id}`, JSON.stringify(jwkAES))
+                console.log("AES Key derived successfully: ", AES_MAC.AESKey);
+            })
+
+            crypto.subtle.exportKey("jwk", AES_MAC.MACKey).then(jwkMAC => {
+                localStorage.setItem(`MAC${Salt}_USER${myID}to${peer_id}`, JSON.stringify(jwkMAC))
+                console.log("MAC Key derived successfully: ", AES_MAC.MACKey);
+            })
+        }
+
+    }catch (error) {
+        console.error("Error in fetching peer's public key:", error);
+    }
+}
+
+async function importKey(keyname,index=-1){
+    let parameters;
+    let keyUsages;
+    let strKey
+    let info = `USER${myID}to${peer_id}`
+
+    if (keyname === "privateKey" || keyname === "publicKey")
+    {
+        parameters = {name: "ECDH",namedCurve: "P-384"};
+        keyUsages = ["deriveKey"];
+        strKey = keyname
+    }
+    else if (keyname === "AESKey"){
+        parameters = {name: "AES-GCM",length: 256,};
+        keyUsages = ["encrypt","decrypt"];
+        strKey = `AES${index}_`+info
+    }
+    else if (keyname === "MACKey"){
+        parameters = {name: "HMAC",hash: "SHA-256",length: 256,};
+        keyUsages = ["sign", "verify"];
+        strKey = `MAC${index}_`+info
+    }
+    else if (keyname === `peerPK`){
+        parameters = {name: "ECDH",namedCurve: "P-384"};
+        keyUsages = [];
+        strKey = `peerPK_${peer_id}`
+    }
+
+    strKey = localStorage.getItem(strKey)
+    if(strKey){
+        let jwk_Key = JSON.parse(strKey)
+        try{
+             return crypto.subtle.importKey("jwk",jwk_Key,parameters,true,keyUsages);
+        }catch (error){
+            console.error(`Key "${keyname}" imported failed: `,error)
+        }
+    }else{
+        console.error(`No key for ${keyname} found in the storage!`)
+    }
+
+}
+
+async function deriveKeys(peerPublicKey, salt=Salt){
+    try {
+        const privateKey = await importKey("privateKey")
+        const sharedSecret = await crypto.subtle.deriveKey(   //Deriving shared secret
+            {
+                name: "ECDH",
+                namedCurve: "P-384",
+                public: peerPublicKey,
+            },
+            privateKey,
+            {
+                name: "HKDF",
+                hash: "SHA-256",
+                length: 128,
+            },
+            false,
+            ["deriveKey"]
+        )
+
+        if (sharedSecret) {
+            console.log("Shared secret derived successfully", sharedSecret)
+            const AESOptions = {
+                "algorithm":
+                    {
+                        name: "HKDF",
+                        hash: "SHA-256",
+                        salt: numToUint8Array(salt),
+                        info: new Uint8Array(`CHAT_KEY_USER${myID}to${peer_id}`),
+                    },
+                "derivedKeyAlgorithm":
+                    {
+                        name: "AES-GCM",
+                        length: 256,
+                    },
+            }
+
+            const MACOptions = {
+                "algorithm":
+                    {
+                        name: "HKDF",
+                        hash: "SHA-256",
+                        salt: numToUint8Array(salt),
+                        info: new Uint8Array(`CHAT_MAC_USER${myID}to${peer_id}`),
+                    },
+                "derivedKeyAlgorithm":
+                    {
+                        name: "HMAC",
+                        hash: "SHA-256",
+                        length: 256,
+                    },
+            }
+
+            const AESKey = await crypto.subtle.deriveKey(
+                AESOptions["algorithm"],
+                sharedSecret,
+                AESOptions["derivedKeyAlgorithm"],
+                true,
+                ["encrypt", "decrypt"]
+            )
+
+            const MACKey = await crypto.subtle.deriveKey(
+                MACOptions["algorithm"],
+                sharedSecret,
+                MACOptions["derivedKeyAlgorithm"],
+                true,
+                ["sign", "verify"]
+            )
+
+            return {
+                AESKey: AESKey,
+                MACKey: MACKey,
+            }
+        }
+    } catch (error) {
+        console.log('Key derivation error: ', error)
+        return false
+    }
+}
+
+async function encryptMessage(message, KeyID, ivCounter) {
+    const AESKey = await importKey("AESKey",KeyID)
+    const MACKey = await importKey("MACKey",KeyID)
+    const ivBuffer = numToUint8Array(ivCounter);
+    const tag = await window.crypto.subtle.sign(
+            "HMAC",
+            MACKey,
+            ivBuffer
+    );
+
+    const encoded = new TextEncoder('utf-8').encode(message);
+    const ciphertext = await window.crypto.subtle.encrypt(
+            {
+                name: "AES-GCM",
+                iv: ivBuffer,
+            },
+            AESKey,
+            encoded
+    );
+    return {
+        iv: ivBuffer,
+        tag: tag,
+        ciphertext: ciphertext
+    }
+}
+
+// Send message function
+async function sendMessage() {
+    if (peer_id === -1) return; // Exit if no peer selected
+
+    const message = document.getElementById('messageInput').value;
+
+    encryptMessage(message, Salt, ivCounter).then(ciphertextBody => {
+
+        console.log('ciphertextBody', ciphertextBody)
+
+        const payload = {
+            receiver_id: peer_id,
+            iv: base64Encode(ciphertextBody.iv),
+            ciphertext: base64Encode(ciphertextBody.ciphertext),
+            tag: base64Encode(ciphertextBody.tag)
+        };
+        console.log('payload', JSON.stringify(payload))
+        fetch('/send_message', {
+            method: 'POST', // Specify the method
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(payload),
+        }).then(response => {
+            if (!response.ok) {
+                // If the server response is not OK, throw an error
+                throw new Error('Network response was not ok');
+            }
+            return response.json(); // Parse JSON response from the server
+        }).then(data => {
+            document.getElementById('messageInput').value = ''; // Clear the input after sending
+        }).catch(error => {
+            console.error('Error sending message:', error); // Log any errors
+        });
+    })
+}
+
+async function decryptMessage(message, keyID) {
+    async function checkIv(message,macKey) {
+        console.log('message', message)
+        console.log('message.iv', message.iv)
+
+        try {
+            const ivBuffer = base64Decode(message.iv)
+            const tag = base64Decode(message.tag)
+
+            const isValid = await crypto.subtle.verify(
+                "HMAC",
+                macKey,
+                tag,
+                ivBuffer,
+            );
+            if (isValid) {
+                if (message.sender_id === myID && message.receiver_id === peer_id) {
+                    ivCounter++;
+                    localStorage.setItem(`ivCounter_${myID}to${peer_id}`, ivCounter)
+                }
+            }
+            return {
+                isValid: isValid,
+                iv: ivBuffer
+            }
+        } catch (error) {
+            console.error('checkIV', error)
+            return false
+        }
+
+    }
+
+    const MACKey = await importKey("MACKey",keyID)
+    const AESKey = await importKey("AESKey",keyID)
+
+    const message_text = base64Decode(message.message_text)
+    if(new TextDecoder().decode(message_text) === "change"){
+        return "Key Changed"
+    }else{
+        const checkIvResult = await checkIv(message,MACKey)
+        console.log('verifyresult', checkIvResult)
+        if (checkIvResult.isValid) {
+            try {
+                let decrypted = await window.crypto.subtle.decrypt(
+                    {
+                        name: "AES-GCM",
+                        iv: checkIvResult.iv,
+                    },
+                    AESKey,
+                    message_text
+                );
+                const decryptedText = new TextDecoder().decode(new Uint8Array(decrypted))
+                console.log('decryptedText', decryptedText)
+                return decryptedText;
+            } catch (e) {
+                console.log(e)
+            }
+        }
+    }
+}
+
+
+async function deriveNewKeys(message) {
+    verifyNewMac(message).then(verifyBody=>{
+        if (verifyBody.isValid) {
+            Salt++
+            localStorage.setItem(`Salt_${myID}to${peer_id}`,JSON.stringify(Salt))
+            if (verifyBody.newKeys){
+                crypto.subtle.exportKey("jwk", verifyBody.newKeys.AESKey).then(jwkAES => {
+                    localStorage.setItem(`AES${Salt}_USER${myID}to${peer_id}`, JSON.stringify(jwkAES))
+                    console.log("new AES Key derived successfully: ", verifyBody.newKeys.AESKey);
+                })
+
+                crypto.subtle.exportKey("jwk", verifyBody.newKeys.MACKey).then(jwkMAC => {
+                    localStorage.setItem(`MAC${Salt}_USER${myID}to${peer_id}`, JSON.stringify(jwkMAC))
+                    console.log("new MAC Key derived successfully: ", verifyBody.newKeys.MACKey);
+                })
+            }
+
+            console.log("Salt updated: ",Salt)
+        }
+    })
+}
+
+
+async function verifyNewMac(message) {
+    const oldMAC_isValid = await crypto.subtle.verify(
+        "HMAC",
+        await importKey("MACKey",Salt),
+        base64Decode(message.tag),
+        base64Decode(message.iv)
+    );
+
+    try {
+        if (oldMAC_isValid){
+            const PeerPublicKey =await importKey(`peerPK`)
+            const newKeys = await deriveKeys(PeerPublicKey,Salt+1)
+
+            const newMAC_isValid = await crypto.subtle.verify(
+                "HMAC",
+                newKeys.MACKey,
+                base64Decode(message.second_tag),
+                base64Decode(message.iv)
+            )
+            if(newMAC_isValid){
+                return {
+                    isValid: true,
+                    newKeys: newKeys
+                }
+            }else
+                console.log("Warning: the new MAC is not valid!")
+
+        }else{
+            console.log("Warning: the old MAC is not valid!")
+        }
+    }catch (error){
+        console.error("Error: ",error)
+        return false;
+    }
+    return false;
+}
+
+
+
+// Fetch messages from server
+function fetchMessages() {
+    let KeyID = 0
+    if (peer_id === -1) return; // Exit if no peer selected
+    fetch(`/fetch_messages?last_message_id=${lastMessageId}&peer_id=${peer_id}`)
+        .then(response => response.json())
+        .then(async data => {
+            let messages_length = data.messages.length
+
+            for (const message of data.messages) {
+                if (messages_length > 1) {
+                    if (message.second_tag !== null) KeyID++
+                    await displayMessage(message, KeyID)
+
+                } else {
+                    if (message.second_tag !== null && new Date() - new Date(message.created_at) <= 60000) deriveNewKeys(message) // indicating that it is a special key refresh message
+                    await displayMessage(message, Salt);
+                }
+                lastMessageId = message.message_id;
+            }
+        })
+        .catch(error => console.error('Error fetching messages:', error));
+}
+
+// Display a single message
+async function displayMessage(message,keyID) {
+    decryptMessage(message, keyID).then(message_text => {
+        if (message_text) {
+            const messagesContainer = document.getElementById('messages');
+            const messageElement = document.createElement('div');
+            if(message_text === "Key Changed"){
+                messageElement.textContent = `|--------${message_text}--------|`;
+
+            } else{            // Determine sender and receiver strings
+                const sender = message.sender_id === myID ? "me" : (userInfo[message.sender_id] || `User ${message.sender_id}`);
+                const receiver = message.receiver_id === myID ? "me" : (userInfo[message.receiver_id] || `User ${message.receiver_id}`);
+
+                messageElement.textContent = `From ${sender} to ${receiver}: ${message_text}`;
+            }
+            messagesContainer.appendChild(messageElement);
+        }
+    })
+}
+
+// Ctrl+Enter to send message
+document.addEventListener('DOMContentLoaded', function () {
+    document.getElementById('messageInput').addEventListener('keydown', function (e) {
+        if (e.ctrlKey && e.key === 'Enter') {
+            sendMessage();
+        }
+    });
+});
+
+// Refresh Keys function placeholder
+async function refreshKeys() {
+    if (peer_id === -1) return; // Exit if no peer selected
+
+    // const Old_AESKey = await importKey("AESKey")
+    const Old_MACKey = await importKey("MACKey",Salt)
+    const PeerPublicKey = await importKey(`peerPK`)
+    const new_Keys = await deriveKeys(PeerPublicKey,Salt+1)
+    const message = new TextEncoder('utf-8').encode("change")
+    const ivBuffer = numToUint8Array(ivCounter)
+
+    const old_tag = await window.crypto.subtle.sign(
+        "HMAC",
+        Old_MACKey,
+        ivBuffer
+    );
+
+    const new_tag = await window.crypto.subtle.sign(
+        "HMAC",
+        new_Keys.MACKey,
+        ivBuffer
+    );
+
+    const payload = {
+        receiver_id: peer_id,
+        iv: base64Encode(ivBuffer),
+        ciphertext: base64Encode(message),
+        tag: base64Encode(old_tag),
+        second_tag: base64Encode(new_tag)
+    };
+
+    console.log('payload', JSON.stringify(payload))
+
+    fetch('/refreshKey', {
+        method: 'POST', // Specify the method
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+    }).then(response => {
+        if (!response.ok) {
+            // If the server response is not OK, throw an error
+            throw new Error('Network response was not ok');
+        }
+        return response.json(); // Parse JSON response from the server
+    }).then(data => {
+        console.log(data.status)
+        console.log(`Old Mac: ${Old_MACKey}\nNew Mac: ${new_Keys.MACKey}`)
+        document.getElementById('messageInput').value = ''; // Clear the input after sending
+
+    }).catch(error => {
+        console.error('Error sending message:', error); // Log any errors
+    });
+}
+
+// Populate users function
+function populateUsers(users) {
+    const userListDropdown = document.getElementById("userList");
+    users.forEach(user => {
+        const option = new Option(user[1], user[0]); // username as text, user_id as value
+        userListDropdown.add(option);
+    });
+}
+
+// Fetch users from server
+$(document).ready(function() {
+    fetch('/users')
+        .then(response => response.json())
+        .then(data => {
+            data.users.forEach(user => {
+                userInfo[user[0]] = user[1]; // Map user_id to username
+            });
+            console.log(userInfo);
+            populateUsers(data.users);
+        })
+        .catch(error => console.error('Error fetching user info:', error));
+});
+
+// Handle user selection change
+document.getElementById('userList').addEventListener('change', event => {
+    peer_id = parseInt(event.target.value, 10); // Convert selected peer_id to integer
+    if (localStorage.getItem(`peerPK_${peer_id}`) === null) {
+        pull_peerPublicKey()
+    }
+    clearChatBox();
+    let lastIVCounter = localStorage.getItem(`ivCounter_${myID}to${peer_id}`)
+    let lastSalt = localStorage.getItem(`Salt_${myID}to${peer_id}`)
+
+    lastMessageId = 0;
+    ivCounter = lastIVCounter === null ? 0 : parseInt(lastIVCounter)
+    Salt = lastSalt === null ? 0 : parseInt(lastSalt);
+    fetchMessages(); // Fetch messages for the new selection
+});
+
+// Clear chat box
+function clearChatBox() {
+    document.getElementById('messages').innerHTML = '';
+}
+
+// Periodically fetch new messages every second
+setInterval(fetchMessages, 1000);
+
+// Erase Chat function using fetch API
+function eraseChat() {
+    if (peer_id === -1) return; // Exit if no peer selected
+    if (!confirm('Are you sure you want to erase the chat with '+userInfo[peer_id]+'?')) return; // Confirmation before erasing
+
+    fetch(`/erase_chat`, {
+        method: 'POST',  // A REST API should use POST if it leads to modifications
+        headers: {
+            'Content-Type': 'application/json', 
+        },
+        body: JSON.stringify({ peer_id: peer_id })
+    })
+    .then(response => {
+        if (!response.ok) {
+            throw new Error('Network response was not ok');
+        }
+        return response.json(); // Assuming the server responds with JSON
+    })
+    .then(data => {
+        console.log('Chat erased:', data);
+        clearChatBox(); // Clear the chat display
+    })
+    .catch(error => {
+        console.error('Error erasing chat:', error);
+    });
+}
+
+function base64Encode(ciphertext) {
+    const uint8Array = new Uint8Array(ciphertext);
+    const binaryString = uint8Array.reduce((str, byte) => str + String.fromCharCode(byte), '');
+    return btoa(binaryString);
+}
+
+function base64Decode(base64url) {
+    const decodedBinaryString = atob(base64url);
+    let decodedUint8Array = new Uint8Array(decodedBinaryString.length);
+    for (let i = 0; i < decodedBinaryString.length; i++) {
+        decodedUint8Array[i] = decodedBinaryString.charCodeAt(i);
+    }
+    return decodedUint8Array
+}
+
+function numToUint8Array(num) {
+    let n = 12;
+    const arr = new Uint8Array(n);
+    for (let i = 0; i < 8; i++) {
+        arr[i] = num % 256;
+        num = Math.floor(num / 256);
+    }
+    return arr;
+}
+
+setTimeout(() => {
+    window.addEventListener('storage', async () => {
+        if (localStorage.length === 0) {
+            alert("Local Storage has been cleared, previous messages may not be decrypted");
+            peer_id = -1
+            document.getElementById("userList").value = -1
+            await initialization();
+            ivCounter = parseInt(localStorage.getItem(`ivCounter_${myID}to${peer_id}`)) || 0;
+        }
+    });
+}, 3000);
+
+</script>
+</body>
+</html>

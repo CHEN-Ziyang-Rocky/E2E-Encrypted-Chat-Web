@@ -1,0 +1,22 @@
+[ req ]
+default_bits = 384
+prompt = no
+default_md = SHA384
+distinguished_name = dn
+x509_extensions = v3_req
+
+[ dn ]
+countryName         = HK
+commonName          = group-31.comp3334.xavier2dc.fr
+
+[ v3_req ]
+subjectAltName = @alt_names
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer
+basicConstraints = critical, CA:false
+keyUsage = critical,digitalSignature
+extendedKeyUsage=serverAuth
+
+[ alt_names ]
+DNS.1 = group-31.comp3334.xavier2dc.fr
+
